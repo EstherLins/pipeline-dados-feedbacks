@@ -27,11 +27,11 @@ Cada registro (linha) representa a resposta de um aluno a uma pesquisa de satisf
 
 Os dados são **sintéticos**, gerados programaticamente para simular pesquisas de satisfação reais, e passaram pelas seguintes adaptações intencionais:
 
-- **Volume**: cada aba recebeu entre 105 e 130 registros (mínimo de 100 por planilha), com nomes de alunos, datas e distribuições geradas aleatoriamente.
-- **Campos adicionais** além dos exigidos originalmente: `Turma/Módulo`, `Modalidade` (EAD, Presencial, Híbrido) e `% do curso concluído`, incluídos para enriquecer o contexto de análise de evasão.
-- **Ruído proposital entre rótulo e texto livre**: nos campos abertos (sugestão e reclamação), cerca de 50% do texto é coerente com a categoria de problema marcada, ~20% reflete uma categoria diferente da marcada e ~30% é um comentário genérico/vago sem pista clara de categoria — simulando a subjetividade real de respostas humanas e servindo como conjunto de teste para o classificador Python (não para o LLM).
-- **Correlação fraca entre CSAT e NPS**: em 20% dos registros o NPS é sorteado de forma independente do CSAT, para não gerar uma relação artificialmente perfeita entre as duas métricas.
-- **Anonimização antes da categorização**: a coluna `Nome do Aluno` é removida (ou substituída por um ID interno) antes de os textos passarem pelo classificador e antes de qualquer dado ser exposto ao LLM de interação — nenhum nome de aluno é processado pelo modelo de linguagem.
+- **Volume**: cada aba recebeu entre 105 e 130 registros (mínimo de 100 por planilha).
+- **Campos adicionais**: `Turma/Módulo`, `Modalidade` (EAD, Presencial, Híbrido) e `% do curso concluído`, incluídos para enriquecer o contexto de análise de evasão e servir de variáveis para os cruzamentos feitos pelas ferramentas do agente.
+- **Ruído proposital entre rótulo e texto livre**: nos campos abertos, cerca de 50% do texto é coerente com a categoria marcada, ~20% reflete uma categoria diferente e ~30% é um comentário genérico/vago — usado como conjunto de teste do classificador Python.
+- **Correlação fraca entre CSAT e NPS**: em 20% dos registros o NPS é sorteado de forma independente do CSAT.
+- **Anonimização antes da categorização**: a coluna `Nome do Aluno` é removida (ou substituída por um ID interno) antes de os textos passarem pelo classificador e antes de a planilha consolidada ficar disponível para as ferramentas do agente — nenhuma ferramenta exposta ao LLM retorna nome de aluno.
 
 ---
 
@@ -39,38 +39,63 @@ Os dados são **sintéticos**, gerados programaticamente para simular pesquisas 
 
 ### Como os dados são carregados?
 
-Os dados chegam por meio de uma integração via API (gspread) com as planilhas-fonte das pesquisas de satisfação, passando por um pipeline Python responsável por extrair, tratar, anonimizar e consolidar as respostas dos diferentes projetos e ciclos em uma única planilha.
+Os dados chegam por meio de uma integração via API (gspread) com as planilhas-fonte, passando por um pipeline Python que extrai, trata, anonimiza e consolida as respostas em uma única planilha. A categorização por tema é feita inteiramente em Python (classificador treinado ou regras), sem uso de LLM.
 
-**A categorização por tema é feita inteiramente em Python, sem uso de LLM**: um classificador treinado ou um conjunto de regras de palavras-chave atribui a categoria (Acesso a equipamentos, Plataforma utilizada, Qualidade do conteúdo, Didática de ensino, Suporte ou Sem categoria clara) a cada comentário aberto. Essa etapa roda de forma determinística, rápida e sem custo de inferência de modelo generativo.
+**A planilha consolidada não é entregue diretamente ao LLM.** Em vez disso, ela é carregada em memória (pandas DataFrame) por um módulo de **ferramentas** (`ferramentas.py`), que expõe um conjunto fechado de funções para consultar e cruzar os dados:
 
-O **Ollama entra só depois**, na camada de interação: quando o usuário faz uma pergunta na interface Streamlit, o modelo local recebe o recorte de dados já tratado e categorizado (filtrado por Python conforme a pergunta) e sua única função é interpretar a pergunta e formular a resposta em linguagem natural — ele nunca vê o dado bruto nem participa da categorização.
+| Ferramenta | O que faz |
+|---|---|
+| `calcular_metricas(projeto, ciclo)` | CSAT médio, NPS médio, total de registros e distribuição de categorias de um projeto/ciclo |
+| `comparar_ciclos(projeto)` | Compara as métricas entre todos os ciclos de um mesmo projeto |
+| `cruzar_variaveis(coluna_a, coluna_b, projeto)` | Tabela de contingência entre duas colunas categóricas (ex.: Modalidade x Categoria) |
+| `correlacionar_numericas(coluna_a, coluna_b, projeto)` | Correlação entre duas colunas numéricas (CSAT, NPS, % do curso concluído) |
+| `top_reclamacoes_categoria(categoria, projeto, limite)` | Retorna exemplos reais de reclamações de uma categoria específica |
 
-Esse pipeline é o que garante que a planilha final chegue já consolidada (uma aba por projeto/ciclo, com colunas padronizadas e categoria já preenchida pelo classificador). É esse arquivo consolidado — e não os dados brutos das planilhas-fonte — que funciona como a base de conhecimento do agente. No início da sessão da interface Streamlit, o agente lê todas as abas do arquivo consolidado e carrega os registros em memória (ex.: um DataFrame por aba ou um único DataFrame com a coluna `Projeto`/`Ciclo` já identificando a origem).
+O Ollama recebe o schema dessas ferramentas junto com a pergunta do usuário. Ele decide qual ferramenta chamar e com quais argumentos; a função roda de verdade sobre o DataFrame consolidado; o resultado numérico real volta para o modelo, que formula a resposta final. Esse ciclo (pergunta → escolha da ferramenta → execução real → resposta) é repetido até um limite de rodadas (ex.: 3) para permitir perguntas que exigem mais de uma consulta (como comparar dois ciclos), sem correr risco de loop infinito.
 
 ### Como os dados são usados no prompt?
 
-Os dados não são inseridos integralmente no prompt do LLM (o volume de 580 linhas inviabilizaria isso, e modelos locais tendem a ser mais sensíveis a prompts longos do que LLMs de fronteira). A divisão de trabalho é:
+O prompt enviado ao Ollama nunca contém a planilha ou um recorte bruto dela. Ele contém:
 
-- **Python calcula, o LLM explica.** Agregações numéricas (médias de CSAT/NPS, contagens por categoria, comparação entre ciclos) são sempre calculadas em código antes de chegar ao modelo — o Ollama nunca é solicitado a somar, contar ou calcular médias sozinho, apenas a interpretar números já prontos.
-- **Filtragem por Python, não pelo LLM.** Quando o usuário pergunta sobre um projeto/ciclo/categoria específico, o filtro nos dados é feito em pandas antes de montar o prompt — apenas o recorte relevante entra no contexto enviado ao Ollama.
-- O prompt final enviado ao modelo local combina: (1) o resumo agregado relevante à pergunta, já calculado, e (2) alguns exemplos de comentários daquele recorte (já categorizados pelo classificador Python), servindo apenas como ilustração qualitativa — nunca como fonte de novos rótulos.
+1. O **system prompt** com as regras do agente e a lista de ferramentas disponíveis (schema JSON).
+2. A **pergunta do usuário**.
+3. Após a primeira resposta do modelo (que pede uma chamada de ferramenta), o **resultado real** dessa chamada é anexado à conversa como uma mensagem do tipo `tool`, e uma nova chamada ao modelo é feita para ele formular a resposta final com base nesse resultado.
+
+Isso significa que o LLM nunca "vê" os 580 registros de uma vez — ele só enxerga o resultado já processado e filtrado da ferramenta que ele mesmo escolheu chamar.
 
 ---
 
 ## Exemplo de Contexto Montado
 
+Fluxo real de uma pergunta, mostrando as mensagens trocadas com o Ollama:
+
 ```
-Registro de Pesquisa de Satisfação (já categorizado pelo pipeline Python):
-- Projeto: Projeto 2 | Ciclo: 1
-- Modalidade: EAD | Turma: C3
-- % do curso concluído: 40%
-- Data do registro: 01/03/2025 03:45
-- CSAT: 3/5 | NPS: 3/10
-- Categoria atribuída pelo classificador: Didática de ensino (confiança: 0.78)
-- Sugestão de melhoria: "Pra mim, seria legal ter algum tipo de auxílio pra comprar um equipamento melhor."
-- Reclamação relatada: "Nada que me faça pensar em desistir, só um cansaço geral."
+[system] Você é um agente de análise de satisfação acadêmica. Nunca calcule
+números sozinho — sempre use as ferramentas disponíveis.
+
+[user] Como está o Projeto 2 no Ciclo 1?
+
+[assistant → tool_call] calcular_metricas(projeto="Projeto 2", ciclo=1)
+
+[tool → resultado real, calculado em pandas]
+{
+  "registros": 120,
+  "csat_medio": 3.4,
+  "nps_medio": 4.1,
+  "categoria_mais_frequente": "Qualidade do conteúdo",
+  "distribuicao_categorias": {
+    "Qualidade do conteúdo": 34,
+    "Plataforma utilizada": 28,
+    "Suporte": 25,
+    "Didática de ensino": 20,
+    "Acesso a equipamentos": 13
+  }
+}
+
+[assistant → resposta final]
+No Projeto 2 - Ciclo 1 (120 registros), o CSAT médio foi 3,4 e o NPS médio
+foi 4,1. A categoria mais citada como principal problema foi "Qualidade do
+conteúdo" (34 registros), seguida de "Plataforma utilizada" (28).
 ```
 
-> Observações:
-> - O campo "Nome do Aluno" foi removido do contexto — a identificação do respondente não é enviada ao LLM.
-> - A categoria já vem atribuída pelo classificador Python (com um score de confiança), o LLM não reclassifica — ele apenas usa essa informação para responder à pergunta do usuário.
+> Observação: em nenhum momento o nome de um aluno, ou a planilha bruta, passa pelo modelo — apenas o resultado agregado e já anonimizado da ferramenta chamada.
