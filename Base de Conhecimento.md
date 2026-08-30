@@ -41,15 +41,15 @@ Os dados são **sintéticos**, gerados programaticamente para simular pesquisas 
 
 ### Como os dados são carregados?
 
-O arquivo `.xlsx` é carregado no início da sessão do agente, lendo todas as 5 abas e consolidando os registros em memória (ex.: um DataFrame por aba ou um único DataFrame com a coluna `Projeto`/`Ciclo` já identificando a origem). Não há consulta em banco de dados externo — a base de conhecimento é estática e lida diretamente do arquivo local.
+Os dados não são inseridos manualmente: eles chegam por meio de uma integração via API com as planilhas das pesquisas de satisfação, passando por um pipeline de dados responsável por extrair, tratar e consolidar as respostas dos diferentes projetos e ciclos em uma única planilha.
+
+Esse pipeline é o que garante que a planilha final chegue já consolidada (uma aba por projeto/ciclo, com colunas padronizadas), é esse arquivo consolidado, e não os dados brutos da API, que funciona como a base de conhecimento do agente. No início da sessão, o agente lê todas as abas do arquivo consolidado e carrega os registros em memória (ex.: um DataFrame por aba ou um único DataFrame com a coluna Projeto/Ciclo já identificando a origem), sem precisar consultar a API diretamente a cada interação.
 
 ### Como os dados são usados no prompt?
 
 Os dados não são inseridos integralmente no system prompt (o volume de 580 linhas inviabilizaria isso). Em vez disso:
 
-- Um **resumo agregado** (médias de CSAT/NPS por projeto/ciclo, distribuição das categorias de problema) pode compor o contexto fixo do system prompt.
 - Os **registros individuais** são consultados dinamicamente conforme a pergunta do usuário (ex.: filtrando por projeto, ciclo, categoria de problema ou faixa de data) e inseridos no prompt apenas os trechos relevantes à consulta.
-- Os campos de texto livre (sugestão/reclamação) são a principal entrada para tarefas de classificação e sumarização, sendo passados ao agente junto com o rótulo original quando o objetivo é avaliar ou treinar a categorização.
 
 ---
 
